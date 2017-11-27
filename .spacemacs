@@ -1,624 +1,436 @@
-  /*
- ******************************************************************************
- *                               mm-baseline.c                                *
- *           64-bit struct-based implicit free list memory allocator          *
- *                  15-213: Introduction to Computer Systems                  *
- *                                                                            *
- *  ************************************************************************  *
- *                               DOCUMENTATION                                *
- *                                                                           *
- *  ************************************************************************  *
- *  ** ADVICE FOR STUDENTS. **                                                *
- *  Step 0: Please read the writeup!                                          *
- *  Write your heap checker. Write your heap checker. Write. Heap. checker.   *
- *  Good luck, and have fun!                                                  *
- *                                                                            *
- ******************************************************************************
- */
-
-/* Do not change the following! */
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <assert.h>
-#include <stddef.h>
-
-#include "mm.h"
-#include "memlib.h"
-
-#ifdef DRIVER
-/* create aliases for driver tests */
-#define malloc mm_malloc
-#define free mm_free
-#define realloc mm_realloc
-#define calloc mm_calloc
-#define memset mem_memset
-#define memcpy mem_memcpy
-#endif /* def DRIVER */
-
-/* You can change anything from here onward */
-
-/*
- * If DEBUG is defined, enable printing on dbg_printf and contracts.
- * Debugging macros, with names beginning "dbg_" are allowed.
- * You may not define any other macros having arguments.
- */
-//#define DEBUG // uncomment this line to enable debugging
-
-#ifdef DEBUG
-/* When debugging is enabled, these form aliases to useful functions */
-#define dbg_printf(...) printf(__VA_ARGS__)
-#define dbg_requires(...) assert(__VA_ARGS__)
-#define dbg_assert(...) assert(__VA_ARGS__)
-#define dbg_ensures(...) assert(__VA_ARGS__)
-#else
-/* When debugging is disnabled, no code gets generated for these */
-#define dbg_printf(...)
-#define dbg_requires(...)
-#define dbg_assert(...)
-#define dbg_ensures(...)
-#endif
-
-/* Basic constants */
-typedef uint64_t word_t;
-static const size_t wsize = sizeof(word_t);   // word and header size (bytes)
-static const size_t dsize = 2*wsize;          // double word size (bytes)
-static const size_t min_block_size = 2*dsize; // Minimum block size
-static const size_t chunksize = (1 << 12);    // requires (chunksize % 16 == 0)
-
-static const word_t alloc_mask = 0x1;
-static const word_t size_mask = ~(word_t)0xF;
-
-typedef struct block
-{
-    /* Header contains size + allocation flag */
-    word_t header;
-    /*
-     * We don't know how big the payload will be.  Declaring it as an
-     * array of size 0 allows computing its starting address using
-     * pointer notation.
-     */
-    char payload[0];
-    /*
-     * We can't declare the footer as part of the struct, since its starting
-     * position is unknown
-     */
-} block_t;
-
-
-/* Global variables */
-/* Pointer to first block */
-static block_t *heap_listp = NULL;
-
-/* Function prototypes for internal helper routines */
-static block_t *extend_heap(size_t size);
-static void place(block_t *block, size_t asize);
-static block_t *find_fit(size_t asize);
-static block_t *coalesce(block_t *block);
-
-static size_t max(size_t x, size_t y);
-static size_t round_up(size_t size, size_t n);
-static word_t pack(size_t size, bool alloc);
-
-static size_t extract_size(word_t header);
-static size_t get_size(block_t *block);
-static size_t get_payload_size(block_t *block);
-
-static bool extract_alloc(word_t header);
-static bool get_alloc(block_t *block);
-
-static void write_header(block_t *block, size_t size, bool alloc);
-static void write_footer(block_t *block, size_t size, bool alloc);
-
-static block_t *payload_to_header(void *bp);
-static void *header_to_payload(block_t *block);
-
-static block_t *find_next(block_t *block);
-static word_t *find_prev_footer(block_t *block);
-static block_t *find_prev(block_t *block);
-
-bool mm_checkheap(int lineno);
-
-/*
- * mm_init: initializes the heap; it is run once when heap_start == NULL.
- *          prior to any extend_heap operation, this is the heap:
- *              start            start+8           start+16
- *          INIT: | PROLOGUE_FOOTER | EPILOGUE_HEADER |
- * heap_listp ends up pointing to the epilogue header.
- */
-bool mm_init(void)
-{
-    // Create the initial empty heap
-    word_t *start = (word_t *)(mem_sbrk(2*wsize));
-
-    if (start == (void *)-1)
-    {
-        return false;
-    }
-
-    start[0] = pack(0, true); // Prologue footer
-    start[1] = pack(0, true); // Epilogue header
-    // Heap starts with first block header (epilogue)
-    heap_listp = (block_t *) &(start[1]);
-
-    // Extend the empty heap with a free block of chunksize bytes
-    if (extend_heap(chunksize) == NULL)
-    {
-        return false;
-    }
-    return true;
-}
-
-/*
- * malloc: allocates a block with size at least (size + dsize), rounded up to
- *         the nearest 16 bytes, with a minimum of 2*dsize. Seeks a
- *         sufficiently-large unallocated block on the heap to be allocated.
- *         If no such block is found, extends heap by the maximum between
- *         chunksize and (size + dsize) rounded up to the nearest 16 bytes,
- *         and then attempts to allocate all, or a part of, that memory.
- *         Returns NULL on failure, otherwise returns a pointer to such block.
- *         The allocated block will not be used for further allocations until
- *         freed.
- */
-void *malloc(size_t size)
-{
-    dbg_requires(mm_checkheap(__LINE__));
-
-    size_t asize;      // Adjusted block size
-    size_t extendsize; // Amount to extend heap if no fit is found
-    block_t *block;
-    void *bp = NULL;
-
-    if (heap_listp == NULL) // Initialize heap if it isn't initialized
-    {
-        mm_init();
-    }
-
-    if (size == 0) // Ignore spurious request
-    {
-        dbg_ensures(mm_checkheap(__LINE__));
-        return bp;
-    }
-
-    // Adjust block size to include overhead and to meet alignment requirements
-    asize = round_up(size, dsize) + dsize;
-
-    // Search the free list for a fit
-    block = find_fit(asize);
-
-    // If no fit is found, request more memory, and then and place the block
-    if (block == NULL)
-    {
-        extendsize = max(asize, chunksize);
-        block = extend_heap(extendsize);
-        if (block == NULL) // extend_heap returns an error
-        {
-            return bp;
-        }
-
-    }
-
-    place(block, asize);
-    bp = header_to_payload(block);
-
-    dbg_printf("Malloc size %zd on address %p.\n", size, bp);
-    dbg_ensures(mm_checkheap(__LINE__));
-    return bp;
-}
-
-/*
- * free: Frees the block such that it is no longer allocated while still
- *       maintaining its size. Block will be available for use on malloc.
- */
-void free(void *bp)
-{
-    if (bp == NULL)
-    {
-        return;
-    }
-
-    block_t *block = payload_to_header(bp);
-    size_t size = get_size(block);
-
-    write_header(block, size, false);
-    write_footer(block, size, false);
-
-    coalesce(block);
-}
-
-/*
- * realloc: returns a pointer to an allocated region of at least size bytes:
- *          if ptrv is NULL, then call malloc(size);
- *          if size == 0, then call free(ptr) and returns NULL;
- *          else allocates new region of memory, copies old data to new memory,
- *          and then free old block. Returns old block if realloc fails or
- *          returns new pointer on success.
- */
-void *realloc(void *ptr, size_t size)
-{
-    block_t *block = payload_to_header(ptr);
-    size_t copysize;
-    void *newptr;
-
-    // If size == 0, then free block and return NULL
-    if (size == 0)
-    {
-        free(ptr);
-        return NULL;
-    }
-
-    // If ptr is NULL, then equivalent to malloc
-    if (ptr == NULL)
-    {
-        return malloc(size);
-    }
-
-    // Otherwise, proceed with reallocation
-    newptr = malloc(size);
-    // If malloc fails, the original block is left untouched
-    if (!newptr)
-    {
-        return NULL;
-    }
-
-    // Copy the old data
-    copysize = get_payload_size(block); // gets size of old payload
-    if(size < copysize)
-    {
-        copysize = size;
-    }
-    memcpy(newptr, ptr, copysize);
-
-    // Free the old block
-    free(ptr);
-
-    return newptr;
-}
-
-/*
- * calloc: Allocates a block with size at least (elements * size + dsize)
- *         through malloc, then initializes all bits in allocated memory to 0.
- *         Returns NULL on failure.
- */
-void *calloc(size_t nmemb, size_t size)
-{
-    void *bp;
-    size_t asize = nmemb * size;
-
-    if (asize/nmemb != size)
-    // Multiplication overflowed
-    return NULL;
-
-    bp = malloc(asize);
-    if (bp == NULL)
-    {
-        return NULL;
-    }
-    // Initialize all bits to 0
-    memset(bp, 0, asize);
-
-    return bp;
-}
-
-/******** The remaining content below are helper and debug routines ********/
-
-/*
- * extend_heap: Extends the heap with the requested number of bytes, and
- *              recreates epilogue header. Returns a pointer to the result of
- *              coalescing the newly-created block with previous free block, if
- *              applicable, or NULL in failure.
- */
-static block_t *extend_heap(size_t size)
-{
-    void *bp;
-
-    // Allocate an even number of words to maintain alignment
-    size = round_up(size, dsize);
-    if ((bp = mem_sbrk(size)) == (void *)-1)
-    {
-        return NULL;
-    }
-
-    // Initialize free block header/footer
-    block_t *block = payload_to_header(bp);
-    write_header(block, size, false);
-    write_footer(block, size, false);
-    // Create new epilogue header
-    block_t *block_next = find_next(block);
-    write_header(block_next, 0, true);
-
-    // Coalesce in case the previous block was free
-    return coalesce(block);
-}
-
-/* Coalesce: Coalesces current block with previous and next blocks if either
- *           or both are unallocated; otherwise the block is not modified.
- *           Returns pointer to the coalesced block. After coalescing, the
- *           immediate contiguous previous and next blocks must be allocated.
- */
-static block_t *coalesce(block_t * block)
-{
-    block_t *block_next = find_next(block);
-    block_t *block_prev = find_prev(block);
-
-    bool prev_alloc = extract_alloc(*(find_prev_footer(block)));
-    bool next_alloc = get_alloc(block_next);
-    size_t size = get_size(block);
-
-    if (prev_alloc && next_alloc)              // Case 1
-    {
-        return block;
-    }
-
-    else if (prev_alloc && !next_alloc)        // Case 2
-    {
-        size += get_size(block_next);
-        write_header(block, size, false);
-        write_footer(block, size, false);
-    }
-
-    else if (!prev_alloc && next_alloc)        // Case 3
-    {
-        size += get_size(block_prev);
-        write_header(block_prev, size, false);
-        write_footer(block_prev, size, false);
-        
-        block = block_prev;
-    }
-
-    else                                        // Case 4
-    {
-        size += get_size(block_next) + get_size(block_prev);
-        write_header(block_prev, size, false);
-        write_footer(block_prev, size, false);
-
-        block = block_prev;
-    }
-    return block;
-}
-
-/*
- * place: Places block with size of asize at the start of bp. If the remaining
- *        size is at least the minimum block size, then split the block to the
- *        the allocated block and the remaining block as free, which is then
- *        inserted into the segregated list. Requires that the block is
- *        initially unallocated.
- */
-static void place(block_t *block, size_t asize)
-{
-    size_t csize = get_size(block);
-
-    if ((csize - asize) >= min_block_size)
-    {
-        block_t *block_next;
-        write_header(block, asize, true);
-        write_footer(block, asize, true);
-
-        block_next = find_next(block);
-        // footer depends on info in hdr so we must write header first
-        write_header(block_next, csize-asize, false);
-        write_footer(block_next, csize-asize, false);
-    }
-
-    else
-    {
-        write_header(block, csize, true);
-        write_footer(block, csize, true);
-    }
-}
-
-/*
- * find_fit: Looks for a free block with at least asize bytes with
- *           first-fit policy. Returns NULL if none is found.
- */
-static block_t *find_fit(size_t asize)
-{
-    block_t *block;
-
-    for (block = heap_listp; get_size(block) > 0;
-                             block = find_next(block))
-    {
-
-        if (!(get_alloc(block)) && (asize <= get_size(block)))
-        {
-            return block;
-        }
-    }
-    return NULL; // no fit found
-}
-
-/*
- * max: returns x if x > y, and y otherwise.
- */
-static size_t max(size_t x, size_t y)
-{
-    return (x > y) ? x : y;
-}
-
-
-/*
- * round_up: Rounds size up to next multiple of n
- */
-static size_t round_up(size_t size, size_t n)
-{
-    return (n * ((size + (n-1)) / n));
-}
-
-/*
- * pack: returns a header reflecting a specified size and its alloc status.
- *       If the block is allocated, the lowest bit is set to 1, and 0 otherwise.
- */
-static word_t pack(size_t size, bool alloc)
-{
-    return alloc ? (size | 1) : size;
-}
-
-
-/*
- * extract_size: returns the size of a given header value based on the header
- *               specification above.
- */
-static size_t extract_size(word_t word)
-{
-    return (word & size_mask);
-}
-
-/*
- * get_size: returns the size of a given block by clearing the lowest 4 bits
- *           (as the heap is 16-byte aligned).
- */
-static size_t get_size(block_t *block)
-{
-    return extract_size(block->header);
-}
-
-/*
- * get_payload_size: returns the payload size of a given block, equal to
- *                   the entire block size minus the header and footer sizes.
- */
-static word_t get_payload_size(block_t *block)
-{
-    size_t asize = get_size(block);
-    return asize - dsize;
-}
-
-/*
- * extract_alloc: returns the allocation status of a given header value based
- *                on the header specification above.
- */
-static bool extract_alloc(word_t word)
-{
-    return (bool)(word & alloc_mask);
-}
-
-/*
- * get_alloc: returns true when the block is allocated based on the
- *            block header's lowest bit, and false otherwise.
- */
-static bool get_alloc(block_t *block)
-{
-    return extract_alloc(block->header);
-}
-
-/*
- * write_header: given a block and its size and allocation status,
- *               writes an appropriate value to the block header.
- */
-static void write_header(block_t *block, size_t size, bool alloc)
-{
-    block->header = pack(size, alloc);
-}
-
-
-/*
- * write_footer: given a block and its size and allocation status,
- *               writes an appropriate value to the block footer by first
- *               computing the position of the footer.
- */
-static void write_footer(block_t *block, size_t size, bool alloc)
-{
-    word_t *footerp = (word_t *)((block->payload) + get_size(block) - dsize);
-    *footerp = pack(size, alloc);
-}
-
-
-/*
- * find_next: returns the next consecutive block on the heap by adding the
- *            size of the block.
- */
-static block_t *find_next(block_t *block)
-{
-    dbg_requires(block != NULL);
-    block_t *block_next = (block_t *)(((char *)block) + get_size(block));
-
-    dbg_ensures(block_next != NULL);
-    return block_next;
-}
-
-/*
- * find_prev_footer: returns the footer of the previous block.
- */
-static word_t *find_prev_footer(block_t *block)
-{
-    // Compute previous footer position as one word before the header
-    return (&(block->header)) - 1;
-}
-
-/*
- * find_prev: returns the previous block position by checking the previous
- *            block's footer and calculating the start of the previous block
- *            based on its size.
- */
-static block_t *find_prev(block_t *block)
-{
-    word_t *footerp = find_prev_footer(block);
-    size_t size = extract_size(*footerp);
-    return (block_t *)((char *)block - size);
-}
-
-/*
- * payload_to_header: given a payload pointer, returns a pointer to the
- *                    corresponding block.
- */
-static block_t *payload_to_header(void *bp)
-{
-    return (block_t *)(((char *)bp) - offsetof(block_t, payload));
-}
-
-/*
- * header_to_payload: given a block pointer, returns a pointer to the
- *                    corresponding payload.
- */
-static void *header_to_payload(block_t *block)
-{
-    return (void *)(block->payload);
-}
-
-/* mm_checkheap: checks the heap for correctness; returns true if
- *               the heap is correct, and false otherwise.
- *               can call this function using mm_checkheap(__LINE__);
- *               to identify the line number of the call site.
- */
-bool mm_checkheap(int lineno)
-{
-    /* you will need to write the heap checker yourself. As a filler:
-     * one guacamole is equal to 6.02214086 x 10**23 guacas.
-     * one might even call it
-     * the avocado's number.
-     *
-     * Internal use only: If you mix guacamole on your bibimbap,
-     * do you eat it with a pair of chopsticks, or with a spoon?
-     * (Delete these lines!)
-     */
-
-    (void)lineno; // delete this line; it's a placeholder so that the compiler
-                  // will not warn you about unused variable.
-
-    if (!heap_listp) {
-        printf("NULL heap list pointer!\n");
-        return false;
-    }
-
-    block_t *curr = heap_listp;
-    block_t *next;
-    block_t *hi = mem_heap_hi();
-
-    while ((next = find_next(curr)) + 1 < hi) {
-        word_t hdr = curr->header;
-        word_t ftr = *find_prev_footer(next);
-
-        if (hdr != ftr) {
-            printf(
-                    "Header (0x%016lX) != footer (0x%016lX) at %p\n",
-                    hdr, ftr, curr
-                  );
-            return false;
-        }
-        curr = next;
-    }
-
-    return true;
-}
-
+;; -*- mode: emacs-lisp -*-
+;; This file is loaded by Spacemacs at startup.
+;; It must be stored in your home directory.
+
+(defun dotspacemacs/layers ()
+  "Configuration Layers declaration.
+You should not put any user code in this function besides modifying the variable
+values."
+  (setq-default
+   ;; Base distribution to use. This is a layer contained in the directory
+   ;; `+distribution'. For now available distributions are `spacemacs-base'
+   ;; or `spacemacs'. (default 'spacemacs)
+   dotspacemacs-distribution 'spacemacs
+   ;; Lazy installation of layers (i.e. layers are installed only when a file
+   ;; with a supported type is opened). Possible values are `all', `unused'
+   ;; and `nil'. `unused' will lazy install only unused layers (i.e. layers
+   ;; not listed in variable `dotspacemacs-configuration-layers'), `all' will
+   ;; lazy install any layer that support lazy installation even the layers
+   ;; listed in `dotspacemacs-configuration-layers'. `nil' disable the lazy
+   ;; installation feature and you have to explicitly list a layer in the
+   ;; variable `dotspacemacs-configuration-layers' to install it.
+   ;; (default 'unused)
+   dotspacemacs-enable-lazy-installation 'unused
+   ;; If non-nil then Spacemacs will ask for confirmation before installing
+   ;; a layer lazily. (default t)
+   dotspacemacs-ask-for-lazy-installation t
+   ;; If non-nil layers with lazy install support are lazy installed.
+   ;; List ofset-key additional paths where to look for configuration layers.
+   ;; Paths must have a trailing slash (i.e. `~/.mycontribs/')
+   dotspacemacs-configuration-layer-path '()
+   ;; List of configuration layers to load.
+   dotspacemacs-configuration-layers
+   '(
+     ;; ----------------------------------------------------------------
+     ;; Example of useful layers you may want to use right away.
+     ;; Uncomment some layer names and press <SPC f e R> (Vim style) or
+     ;; <M-m f e R> (Emacs style) to install them.
+     ;; ----------------------------------------------------------------
+     helm
+     auto-completion
+     better-defaults
+     emacs-lisp
+     gtags
+     git
+     markdown
+     (shell :variables
+            shell-default-height 30
+            shell-default-position 'bottom)
+     spell-checking
+     syntax-checking
+     version-control
+     theming
+     (c-c++ :variables c-c++-enable-clang-support t)
+     spacemacs-layouts
+     mineo-rtags
+     )
+   ;; List of additional packages that will be installed without being
+   ;; wrapped in a layer. If you need some configuration for these
+   ;; packages, then consider creating a layer. You can also put the
+   ;; configuration in `dotspacemacs/user-config'.
+   dotspacemacs-additional-packages '(
+                                      color-theme-solarized
+                                      mic-paren
+                                      swiper-helm
+                                      nyan-mode
+                                      smart-hungry-delete
+                                      )
+   ;; A list of packages that cannot be updated.
+   dotspacemacs-frozen-packages '()
+   ;; A list of packages that will not be installed and loaded.
+   dotspacemacs-excluded-packages '(
+                                    )
+   ;; Defines the behaviour of Spacemacs when installing packages.
+   ;; Possible values are `used-only', `used-but-keep-unused' and `all'.
+   ;; `used-only' installs only explicitly used packages and uninstall any
+   ;; unused packages as well as their unused dependencies.
+   ;; `used-but-keep-unused' installs only the used packages but won't uninstall
+   ;; them if they become unused. `all' installs *all* packages supported by
+   ;; Spacemacs and never uninstall them. (default is `used-only')
+   dotspacemacs-install-packages 'used-only))
+
+(defun dotspacemacs/init ()
+  "Initialization function.
+This function is called at the very startup of Spacemacs initialization
+before layers configuration.
+You should not put any user code in there besides modifying the variable
+values."
+  ;; This setq-default sexp is an exhaustive list of all the supported
+  ;; spacemacs settings.
+  (setq-default
+   ;; If non nil ELPA repositories are contacted via HTTPS whenever it's
+   ;; possible. Set it to nil if you have no way to use HTTPS in your
+   ;; environment, otherwise it is strongly recommended to let it set to t.
+   ;; This variable has no effect if Emacs is launched with the parameter
+   ;; `--insecure' which forces the value of this variable to nil.
+   ;; (default t)
+   dotspacemacs-elpa-https t
+   ;; Maximum allowed time in seconds to contact an ELPA repository.
+   dotspacemacs-elpa-timeout 5
+   ;; If non nil then spacemacs will check for updates at startup
+   ;; when the current branch is not `develop'. Note that checking for
+   ;; new versions works via git commands, thus it calls GitHub services
+   ;; whenever you start Emacs. (default nil)
+   dotspacemacs-check-for-update nil
+   ;; If non-nil, a form that evaluates to a package directory. For example, to
+   ;; use different package directories for different Emacs versions, set this
+   ;; to `emacs-version'.
+   dotspacemacs-elpa-subdirectory nil
+   ;; One of `vim', `emacs' or `hybrid'.
+   ;; `hybrid' is like `vim' except that `insert state' is replaced by the
+   ;; `hybrid state' with `emacs' key bindings. The value can also be a list
+   ;; with `:variables' keyword (similar to layers). Check the editing styles
+   ;; section of the documentation for details on available variables.
+   ;; (default 'vim)
+   dotspacemacs-editing-style 'emacs
+   ;; If non nil output loading progress in `*Messages*' buffer. (default nil)
+   dotspacemacs-verbose-loading nil
+   ;; Specify the startup banner. Default value is `official', it displays
+   ;; the official spacemacs logo. An integer value is the index of text
+   ;; banner, `random' chooses a random text banner in `core/banners'
+   ;; directory. A string value must be a path to an image format supported
+   ;; by your Emacs build.
+   ;; If the value is nil then no banner is displayed. (default 'official)
+   dotspacemacs-startup-banner 'official
+   ;; List of items to show in startup buffer or an association list of
+   ;; the form `(list-type . list-size)`. If nil then it is disabled.
+   ;; Possible values for list-type are:
+   ;; `recents' `bookmarks' `projects' `agenda' `todos'."
+   ;; List sizes may be nil, in which case
+   ;; `spacemacs-buffer-startup-lists-length' takes effect.
+   dotspacemacs-startup-lists '((recents . 5)
+                                (projects . 7))
+   ;; True if the home buffer should respond to resize events.
+   dotspacemacs-startup-buffer-responsive t
+   ;; Default major mode of the scratch buffer (default `text-mode')
+   dotspacemacs-scratch-mode 'text-mode
+   ;; List of themes, the first of the list is loaded when spacemacs starts.
+   ;; Press <SPC> T n to cycle to the next theme in the list (works great
+   ;; with 2 themes variants, one dark and one light)
+   dotspacemacs-themes '(
+                         solarized-dark
+                         spacemacs-dark
+                         spacemacs-light)
+   ;; If non nil the cursor color matches the state color in GUI Emacs.
+   dotspacemacs-colorize-cursor-according-to-state nil
+   ;; Default font, or prioritized list of fonts. `powerline-scale' allows to
+   ;; quickly tweak the mode-line size to make separators look not too crappy.
+   dotspacemacs-default-font '("Monaco"
+                               :size 20
+                               :weight normal
+                               :width normal
+                               )   
+   ;; The leader key
+   dotspacemacs-leader-key "SPC"
+   ;; The key used for Emacs commands (M-x) (after pressing on the leader key).
+   ;; (default "SPC")
+   dotspacemacs-emacs-command-key "SPC"
+   ;; The key used for Vim Ex commands (default ":")
+   dotspacemacs-ex-command-key ":"
+   ;; The leader key accessible in `emacs state' and `insert state'
+   ;; (default "M-m")
+   dotspacemacs-emacs-leader-key "M-m"
+   ;; Major mode leader key is a shortcut key which is the equivalent of
+   ;; pressing `<leader> m`. Set it to `nil` to disable it. (default ",")
+   dotspacemacs-major-mode-leader-key ","
+   ;; Major mode leader key accessible in `emacs state' and `insert state'.
+   ;; (default "C-M-m")
+   dotspacemacs-major-mode-emacs-leader-key "C-M-m"
+   ;; These variables control whether separate commands are bound in the GUI to
+   ;; the key pairs C-i, TAB and C-m, RET.
+   ;; Setting it to a non-nil value, allows for separate commands under <C-i>
+   ;; and TAB or <C-m> and RET.
+   ;; In the terminal, these pairs are generally indistinguishable, so this only
+   ;; works in the GUI. (default nil)
+   dotspacemacs-distinguish-gui-tab nil
+   ;; If non nil `Y' is remapped to `y$' in Evil states. (default nil)
+   dotspacemacs-remap-Y-to-y$ nil
+   ;; If non-nil, the shift mappings `<' and `>' retain visual state if used
+   ;; there. (default t)
+   dotspacemacs-retain-visual-state-on-shift t
+   ;; If non-nil, J and K move lines up and down when in visual mode.
+   ;; (default nil)
+   dotspacemacs-visual-line-move-text nil
+   ;; If non nil, inverse the meaning of `g' in `:substitute' Evil ex-command.
+   ;; (default nil)
+   dotspacemacs-ex-substitute-global nil
+   ;; Name of the default layout (default "Default")
+   dotspacemacs-default-layout-name "Default"
+   ;; If non nil the default layout name is displayed in the mode-line.
+   ;; (default nil)
+   dotspacemacs-display-default-layout nil
+   ;; If non nil then the last auto saved layouts are resume automatically upon
+   ;; start. (default nil)
+   dotspacemacs-auto-resume-layouts nil
+   ;; Size (in MB) above which spacemacs will prompt to open the large file
+   ;; literally to avoid performance issues. Opening a file literally means that
+   ;; no major mode or minor modes are active. (default is 1)
+   dotspacemacs-large-file-size 1
+   ;; Location where to auto-save files. Possible values are `original' to
+   ;; auto-save the file in-place, `cache' to auto-save the file to another
+   ;; file stored in the cache directory and `nil' to disable auto-saving.
+   ;; (default 'cache)
+   dotspacemacs-auto-save-file-location 'cache
+   ;; Maximum number of rollback slots to keep in the cache. (default 5)
+   dotspacemacs-max-rollback-slots 5
+   ;; If non nil, `helm' will try to minimize the space it uses. (default nil)
+   dotspacemacs-helm-resize nil
+   ;; if non nil, the helm header is hidden when there is only one source.
+   ;; (default nil)
+   dotspacemacs-helm-no-header nil
+   ;; define the position to display `helm', options are `bottom', `top',
+   ;; `left', or `right'. (default 'bottom)
+   dotspacemacs-helm-position 'bottom
+   ;; Controls fuzzy matching in helm. If set to `always', force fuzzy matching
+   ;; in all non-asynchronous sources. If set to `source', preserve individual
+   ;; source settings. Else, disable fuzzy matching in all sources.
+   ;; (default 'always)
+   dotspacemacs-helm-use-fuzzy 'always
+   ;; If non nil the paste micro-state is enabled. When enabled pressing `p`
+   ;; several times cycle between the kill ring content. (default nil)
+   dotspacemacs-enable-paste-transient-state nil
+   ;; Which-key delay in seconds. The which-key buffer is the popup listing
+   ;; the commands bound to the current keystroke sequence. (default 0.4)
+   dotspacemacs-which-key-delay 0.4
+   ;; Which-key frame position. Possible values are `right', `bottom' and
+   ;; `right-then-bottom'. right-then-bottom tries to display the frame to the
+   ;; right; if there is insufficient space it displays it at the bottom.
+   ;; (default 'bottom)
+   dotspacemacs-which-key-position 'bottom
+   ;; If non nil a progress bar is displayed when spacemacs is loading. This
+   ;; may increase the boot time on some systems and emacs builds, set it to
+   ;; nil to boost the loading time. (default t)
+   dotspacemacs-loading-progress-bar t
+   ;; If non nil the frame is fullscreen when Emacs starts up. (default nil)
+   ;; (Emacs 24.4+ only)
+   dotspacemacs-fullscreen-at-startup nil
+   ;; If non nil `spacemacs/toggle-fullscreen' will not use native fullscreen.
+   ;; Use to disable fullscreen animations in OSX. (default nil)
+   dotspacemacs-fullscreen-use-non-native nil
+   ;; If non nil the frame is maximized when Emacs starts up.
+   ;; Takes effect only if `dotspacemacs-fullscreen-at-startup' is nil.
+   ;; (default nil) (Emacs 24.4+ only)
+   dotspacemacs-maximized-at-startup nil
+   ;; A value from the range (0..100), in increasing opacity, which describes
+   ;; the transparency level of a frame when it's active or selected.
+   ;; Transparency can be toggled through `toggle-transparency'. (default 90)
+   dotspacemacs-active-transparency 90
+   ;; A value from the range (0..100), in increasing opacity, which describes
+   ;; the transparency level of a frame when it's inactive or deselected.
+   ;; Transparency can be toggled through `toggle-transparency'. (default 90)
+   dotspacemacs-inactive-transparency 90
+   ;; If non nil show the titles of transient states. (default t)
+   dotspacemacs-show-transient-state-title t
+   ;; If non nil show the color guide hint for transient state keys. (default t)
+   dotspacemacs-show-transient-state-color-guide t
+   ;; If non nil unicode symbols are displayed in the mode line. (default t)
+   dotspacemacs-mode-line-unicode-symbols t
+   ;; If non nil smooth scrolling (native-scrolling) is enabled. Smooth
+   ;; scrolling overrides the default behavior of Emacs which recenters point
+   ;; when it reaches the top or bottom of the screen. (default t)
+   dotspacemacs-smooth-scrolling t
+   ;; Control line numbers activation.
+   ;; If set to `t' or `relative' line numbers are turned on in all `prog-mode' and
+   ;; `text-mode' derivatives. If set to `relative', line numbers are relative.
+   ;; This variable can also be set to a property list for finer control:
+   ;; '(:relative nil
+   ;;   :disabled-for-modes dired-mode
+   ;;                       doc-view-mode
+   ;;                       markdown-mode
+   ;;                       org-mode
+   ;;                       pdf-view-mode
+   ;;                       text-mode
+   ;;   :size-limit-kb 1000)
+   ;; (default nil)
+   dotspacemacs-line-numbers nil
+   ;; Code folding method. Possible values are `evil' and `origami'.
+   ;; (default 'evil)
+   dotspacemacs-folding-method 'evil
+   ;; If non-nil smartparens-strict-mode will be enabled in programming modes.
+   ;; (default nil)
+   dotspacemacs-smartparens-strict-mode nil
+   ;; If non-nil pressing the closing parenthesis `)' key in insert mode passes
+   ;; over any automatically added closing parenthesis, bracket, quote, etc…
+   ;; This can be temporary disabled by pressing `C-q' before `)'. (default nil)
+   dotspacemacs-smart-closing-parenthesis nil
+   ;; Select a scope to highlight delimiters. Possible values are `any',
+   ;; `current', `all' or `nil'. Default is `all' (highlight any scope and
+   ;; emphasis the current one). (default 'all)
+   dotspacemacs-highlight-delimiters 'all
+   ;; If non nil, advise quit functions to keep server open when quitting.
+   ;; (default nil)
+   dotspacemacs-persistent-server nil
+   ;; List of search tool executable names. Spacemacs uses the first installed
+   ;; tool of the list. Supported tools are `ag', `pt', `ack' and `grep'.
+   ;; (default '("ag" "pt" "ack" "grep"))
+   dotspacemacs-search-tools '("ag" "pt" "ack" "grep")
+   ;; The default package repository used if no explicit repository has been
+   ;; specified with an installed package.
+   ;; Not used for now. (default nil)
+   dotspacemacs-default-package-repository nil
+   ;; Delete whitespace while saving buffer. Possible values are `all'
+   ;; to aggressively delete empty line and long sequences of whitespace,
+   ;; `trailing' to delete only the whitespace at end of lines, `changed'to
+   ;; delete only whitespace for changed lines or `nil' to disable cleanup.
+   ;; (default nil)
+   dotspacemacs-whitespace-cleanup nil
+   ))
+
+(defun dotspacemacs/user-init ()
+  "Initialization function for user code.
+It is called immediately after `dotspacemacs/init', before layer configuration
+executes.
+ This function is mostly useful for variables that need to be set
+before packages are loaded. If you are unsure, you should try in setting them in
+`dotspacemacs/user-config' first."
+  )
+
+(defun dotspacemacs/user-config ()
+  (global-set-key (kbd "M-p") 'rtags-previous-match)
+  (global-set-key (kbd "M-n") 'rtags-next-match)
+  (global-unset-key (kbd "M-]"))
+  (global-set-key (kbd "M-]") 'rtags-find-symbol-at-point)
+  (global-set-key (kbd "M-[") 'rtags-location-stack-back)
+  (global-set-key (kbd "M-\\") 'rtags-find-all-references-at-point)
+
+  (global-set-key (kbd "M-.") 'helm-gtags-dwim)
+    (global-unset-key (kbd "C-s"))
+  (global-set-key (kbd "C-s") 'swiper-helm)
+
+  ;;(setq helm-gtags-auto-update t)
+  (smart-hungry-delete-add-default-hooks)
+  (global-set-key (kbd "<backspace>") 'smart-hungry-delete-backward-char)
+  (global-set-key (kbd "C-d") 'smart-hungry-delete-forward-char)
+  (setq dotspacemacs-auto-resume-layouts t)
+  (setq swiper-helm-display-function 'helm-default-display-buffer)
+  
+  "Configuration function for user code.
+This function is called at the very end of Spacemacs initialization after
+layers configuration.
+This is the place where most of your configurations should be done. Unless it is
+explicitly specified that a variable should be set before a package is loaded,
+you should place your code here."
+  )
+
+;; Do not write anything past this comment. This is where Emacs will
+;; auto-generate custom variable definitions.
+(custom-set-variables
+ ;; custom-set-variables was added by Custom.
+ ;; If you edit it by hand, you could mess it up, so be careful.
+ ;; Your init file should contain only one such instance.
+ ;; If there is more than one, they won't work right.
+ '(ansi-color-names-vector
+   ["#073642" "#dc322f" "#859900" "#b58900" "#268bd2" "#d33682" "#2aa198" "#657b83"])
+ '(compilation-message-face (quote default))
+ '(cua-global-mark-cursor-color "#2aa198")
+ '(cua-normal-cursor-color "#839496")
+ '(cua-overwrite-cursor-color "#b58900")
+ '(cua-read-only-cursor-color "#859900")
+ '(custom-enabled-themes (quote (solarized-dark)))
+ '(custom-safe-themes
+   (quote
+    ("8aebf25556399b58091e533e455dd50a6a9cba958cc4ebb0aab175863c25b9a4" default)))
+ '(evil-want-Y-yank-to-eol nil)
+ '(fci-rule-color "#073642" t)
+ '(highlight-changes-colors (quote ("#d33682" "#6c71c4")))
+ '(highlight-symbol-colors
+   (--map
+    (solarized-color-blend it "#002b36" 0.25)
+    (quote
+     ("#b58900" "#2aa198" "#dc322f" "#6c71c4" "#859900" "#cb4b16" "#268bd2"))))
+ '(highlight-symbol-foreground-color "#93a1a1")
+ '(highlight-tail-colors
+   (quote
+    (("#073642" . 0)
+     ("#546E00" . 20)
+     ("#00736F" . 30)
+     ("#00629D" . 50)
+     ("#7B6000" . 60)
+     ("#8B2C02" . 70)
+     ("#93115C" . 85)
+     ("#073642" . 100))))
+ '(hl-bg-colors
+   (quote
+    ("#7B6000" "#8B2C02" "#990A1B" "#93115C" "#3F4D91" "#00629D" "#00736F" "#546E00")))
+ '(hl-fg-colors
+   (quote
+    ("#002b36" "#002b36" "#002b36" "#002b36" "#002b36" "#002b36" "#002b36" "#002b36")))
+ '(magit-diff-use-overlays nil)
+ '(nrepl-message-colors
+   (quote
+    ("#dc322f" "#cb4b16" "#b58900" "#546E00" "#B4C342" "#00629D" "#2aa198" "#d33682" "#6c71c4")))
+ '(package-selected-packages
+   (quote
+    (cmake-ide levenshtein packed helm avy helm-core async popup mic-paren color-theme-solarized color-theme ac-c-headers youdao-dictionary names chinese-word-at-point pangu-spacing find-by-pinyin-dired ace-pinyin pinyinlib pdf-tools tablist zenburn-theme zen-and-art-theme underwater-theme ujelly-theme twilight-theme twilight-bright-theme twilight-anti-bright-theme toxi-theme tao-theme tangotango-theme tango-plus-theme tango-2-theme sunny-day-theme sublime-themes subatomic256-theme subatomic-theme spacegray-theme soothe-theme solarized-theme soft-stone-theme soft-morning-theme soft-charcoal-theme smyx-theme seti-theme reverse-theme railscasts-theme purple-haze-theme professional-theme planet-theme phoenix-dark-pink-theme phoenix-dark-mono-theme organic-green-theme omtose-phellack-theme oldlace-theme occidental-theme obsidian-theme noctilux-theme naquadah-theme mustang-theme monokai-theme monochrome-theme molokai-theme moe-theme minimal-theme material-theme majapahit-theme madhat2r-theme lush-theme light-soap-theme jbeans-theme jazz-theme ir-black-theme inkpot-theme heroku-theme hemisu-theme hc-zenburn-theme gruvbox-theme gruber-darker-theme grandshell-theme gotham-theme gandalf-theme flatui-theme flatland-theme farmhouse-theme espresso-theme dracula-theme django-theme darktooth-theme autothemer darkokai-theme darkmine-theme darkburn-theme dakrone-theme cyberpunk-theme color-theme-sanityinc-tomorrow color-theme-sanityinc-solarized clues-theme cherry-blossom-theme busybee-theme bubbleberry-theme birds-of-paradise-plus-theme badwolf-theme apropospriate-theme anti-zenburn-theme ample-zen-theme ample-theme alect-themes afternoon-theme smart-hungry-delete rtags helm-rtags nyan-mode wgrep smex ivy-hydra flyspell-correct-ivy counsel-projectile counsel swiper ivy gist swiper-helm lua-mode auto-complete-c-headers helm-gtags ggtags disaster company-c-headers cmake-mode clang-format xterm-color unfill smeargle shell-pop orgit mwim multi-term mmm-mode markdown-toc markdown-mode magit-gitflow helm-gitignore helm-company helm-c-yasnippet gitignore-mode gitconfig-mode gitattributes-mode git-timemachine git-messenger git-link git-gutter-fringe+ git-gutter-fringe fringe-helper git-gutter+ git-gutter gh-md fuzzy flyspell-correct-helm flyspell-correct flycheck-pos-tip pos-tip flycheck evil-magit magit magit-popup git-commit with-editor eshell-z eshell-prompt-extras esh-help diff-hl company-statistics company auto-yasnippet yasnippet auto-dictionary ac-ispell auto-complete ws-butler winum which-key volatile-highlights vi-tilde-fringe uuidgen use-package toc-org spaceline powerline restart-emacs request rainbow-delimiters popwin persp-mode pcre2el paradox spinner org-plus-contrib org-bullets open-junk-file neotree move-text macrostep lorem-ipsum linum-relative link-hint info+ indent-guide hydra hungry-delete hl-todo highlight-parentheses highlight-numbers parent-mode highlight-indentation hide-comnt help-fns+ helm-themes helm-swoop helm-projectile helm-mode-manager helm-make projectile pkg-info epl helm-flx helm-descbinds helm-ag google-translate golden-ratio flx-ido flx fill-column-indicator fancy-battery eyebrowse expand-region exec-path-from-shell evil-visualstar evil-visual-mark-mode evil-unimpaired evil-tutor evil-surround evil-search-highlight-persist evil-numbers evil-nerd-commenter evil-mc evil-matchit evil-lisp-state smartparens evil-indent-plus evil-iedit-state iedit evil-exchange evil-escape evil-ediff evil-args evil-anzu anzu evil goto-chg undo-tree eval-sexp-fu highlight elisp-slime-nav dumb-jump f dash s diminish define-word column-enforce-mode clean-aindent-mode bind-map bind-key auto-highlight-symbol auto-compile aggressive-indent adaptive-wrap ace-window ace-link ace-jump-helm-line)))
+ '(pos-tip-background-color "#073642")
+ '(pos-tip-foreground-color "#93a1a1")
+ '(safe-local-variable-values (quote ((company-clang-arguments "-I../lib/"))))
+ '(smartrep-mode-line-active-bg (solarized-color-blend "#859900" "#073642" 0.2))
+ '(term-default-bg-color "#002b36")
+ '(term-default-fg-color "#839496")
+ '(vc-annotate-background nil)
+ '(vc-annotate-background-mode nil)
+ '(vc-annotate-color-map
+   (quote
+    ((20 . "#dc322f")
+     (40 . "#c85d17")
+     (60 . "#be730b")
+     (80 . "#b58900")
+     (100 . "#a58e00")
+     (120 . "#9d9100")
+     (140 . "#959300")
+     (160 . "#8d9600")
+     (180 . "#859900")
+     (200 . "#669b32")
+     (220 . "#579d4c")
+     (240 . "#489e65")
+     (260 . "#399f7e")
+     (280 . "#2aa198")
+     (300 . "#2898af")
+     (320 . "#2793ba")
+     (340 . "#268fc6")
+     (360 . "#268bd2"))))
+ '(vc-annotate-very-old-color nil)
+ '(weechat-color-list
+   (quote
+    (unspecified "#002b36" "#073642" "#990A1B" "#dc322f" "#546E00" "#859900" "#7B6000" "#b58900" "#00629D" "#268bd2" "#93115C" "#d33682" "#00736F" "#2aa198" "#839496" "#657b83")))
+ '(xterm-color-names
+   ["#073642" "#dc322f" "#859900" "#b58900" "#268bd2" "#d33682" "#2aa198" "#eee8d5"])
+ '(xterm-color-names-bright
+   ["#002b36" "#cb4b16" "#586e75" "#657b83" "#839496" "#6c71c4" "#93a1a1" "#fdf6e3"]))
+(custom-set-faces
+ ;; custom-set-faces was added by Custom.
+ ;; If you edit it by hand, you could mess it up, so be careful.
+ ;; Your init file should contain only one such instance.
+ ;; If there is more than one, they won't work right.
+ )
